@@ -1,7 +1,7 @@
-# DeerFlow Dynamic Loop Controller Design
+# RFC: DeerFlow Dynamic Loop Controller Design
 
 **Date**: 2026-07-07
-**Status**: Draft for user review
+**Status**: Accepted for P0 implementation
 **Scope**: Middleware-based dynamic loop control for the existing lead-agent ReAct loop
 
 ---
@@ -19,6 +19,18 @@ The current safety layer is effective but narrow:
 
 What is missing is run-level loop control. The agent can still spend many turns gathering low-value information, drift across tools without enough new evidence, or continue exploring when the useful next action is to synthesize. The first implementation should make the existing loop more adaptive without creating a second agent runtime or replacing LangGraph's built-in ReAct loop.
 
+## RFC Decision
+
+Implement a conservative lead-agent `DynamicLoopControllerMiddleware` as the P0 solution. Do not replace the current `create_agent(...)` ReAct loop with an explicit `StateGraph` in this phase.
+
+The target behavior is:
+
+```text
+When a long-running lead-agent run keeps using tools but recent tool results no longer add new information, DeerFlow should guide the model to change strategy or wrap up, and should safely force finalization after configured no-progress limits without breaking provider tool-call message validity.
+```
+
+This RFC deliberately treats explicit `StateGraph` dynamic-loop orchestration as a future option that must be justified by benchmark evidence after the middleware and progress-ledger layers are measured.
+
 ## Goals
 
 1. Keep the existing `create_agent(...)` lead-agent loop as the execution engine.
@@ -26,6 +38,19 @@ What is missing is run-level loop control. The agent can still spend many turns 
 3. Improve long-task quality by nudging the model to change strategy, verify, or wrap up at the right time.
 4. Preserve current hard safety controls: recursion clamping, loop detection, token budget, clarification handling, and tool-call pairing semantics.
 5. Make behavior configurable and testable without adding evaluator LLM calls.
+
+## Definition of Done
+
+P0 is complete only when all of these are true:
+
+1. RFC and implementation plan describe the same architecture, file boundaries, configuration, risks, and verification commands.
+2. Every public config field in `dynamic_loop` either has implemented behavior or is explicitly marked future-only. P0 has no inert config fields.
+3. The lead-agent middleware chain includes `DynamicLoopControllerMiddleware` by default and omits it when `dynamic_loop.enabled=false`.
+4. The controller observes completed `ToolMessage`s at model-call boundaries and does not insert messages between `AIMessage(tool_calls=...)` and matching `ToolMessage`s.
+5. The controller emits change-strategy guidance after warning-level stagnation, non-interactive wrap-up guidance when stalled with `non_interactive=true`, and wrap-up guidance under configured budget pressure.
+6. Hard-stop behavior clears structured `tool_calls`, raw provider tool-call metadata, legacy `function_call`, and `finish_reason="tool_calls"` before forcing finalization.
+7. Run-scoped controller state is bounded and cleared at run end.
+8. Focused tests and lint/format checks pass, with coverage for config validation, middleware behavior, lead-agent chain placement, and existing loop/token safety middleware compatibility.
 
 ## Non-Goals
 
@@ -37,6 +62,8 @@ This design intentionally does not include:
 4. Changes to Gateway run lifecycle, `RunManager`, `StreamBridge`, or persistence schemas.
 5. Replacement of `LoopDetectionMiddleware` or `ToolProgressMiddleware`.
 6. Semantic proof that the final answer is correct. The controller only improves loop strategy and termination behavior.
+
+P0 also does not claim to close all long-horizon quality issues. Research-search, SWE-like coding, scientific-computing, and scheduled-task trajectory benchmarks are required before claiming product-level success.
 
 ## Chosen Architecture
 
@@ -115,12 +142,12 @@ Tracked fields:
 ```python
 @dataclass
 class DynamicLoopRunState:
-    model_turns: int = 0
+    observed_model_turns: int = 0
     tool_calls_since_answer: int = 0
     consecutive_no_progress_steps: int = 0
     guidance_sent: set[str] = field(default_factory=set)
     recent_signatures: deque[str] = field(default_factory=lambda: deque(maxlen=20))
-    last_new_info_fingerprint: str | None = None
+    seen_tool_messages: set[str] = field(default_factory=set)
 ```
 
 Rationale:
@@ -161,7 +188,7 @@ The controller should encourage wrap-up when:
 3. The run appears close to `recursion_limit`, when remaining budget can be derived from runtime config and observed model/tool turns.
 4. `non_interactive=true` and the controller would otherwise suggest asking the user.
 
-The first implementation may treat recursion remaining as best-effort. If runtime does not expose an exact current super-step count, use observed model turns and tool-call rounds as an approximation and keep the check conservative.
+The first implementation treats recursion remaining as best-effort. If `runtime.config.recursion_limit` or equivalent runtime metadata is absent, the controller must skip this check rather than guessing. When present, the controller should use observed model turns as a conservative approximation and queue wrap-up guidance when `recursion_limit - observed_model_turns <= wrap_up_when_recursion_remaining`.
 
 ## Guidance Behavior
 
@@ -261,6 +288,8 @@ Add middleware tests:
 8. Hard-limit stagnation clears tool calls and raw provider metadata.
 9. AI/tool message pairing remains valid after guidance injection.
 10. LRU/run cleanup prevents unbounded in-memory tracking.
+11. Recursion-pressure wrap-up guidance is queued when a visible `recursion_limit` is close to the observed model-turn count.
+12. Recursion-pressure guidance is not queued when no `recursion_limit` is visible.
 
 Add integration-style chain tests:
 
@@ -303,10 +332,31 @@ Hard stops can produce incomplete answers. Mitigation: conservative default thre
 
 ## Acceptance Criteria
 
-1. Lead-agent runs include `DynamicLoopControllerMiddleware` when enabled.
-2. The controller detects run-level stagnation and injects strategy guidance without breaking provider message ordering.
-3. The controller can force finalization after configured hard-limit stagnation.
-4. Non-interactive runs are guided to complete without clarification when stalled.
-5. Existing loop detection and tool progress tests still pass.
-6. New config and middleware tests cover defaults, disabled mode, warnings, hard stops, cleanup, and chain order.
-7. `backend/AGENTS.md` documents the new middleware's role and relationship to `ToolProgressMiddleware` and `LoopDetectionMiddleware`.
+| Requirement | Authoritative Evidence |
+|---|---|
+| `DynamicLoopConfig` defaults and threshold validation exist | `backend/tests/test_dynamic_loop_config.py` passes |
+| Every `dynamic_loop` config field is represented in behavior or tests | `backend/tests/test_dynamic_loop_config.py` and `backend/tests/test_dynamic_loop_controller_middleware.py` cover all fields |
+| Lead-agent chain includes the controller when enabled and omits it when disabled | `backend/tests/test_lead_agent_model_resolution.py` passes |
+| Controller is before `LoopDetectionMiddleware` | `backend/tests/test_lead_agent_model_resolution.py` passes |
+| Stagnation increments on no-progress tool results and resets on new information | `backend/tests/test_dynamic_loop_controller_middleware.py` passes |
+| Strategy guidance is injected from `wrap_model_call` after tool results | `backend/tests/test_dynamic_loop_controller_middleware.py` passes |
+| Non-interactive stalled runs are guided to complete without clarification | `backend/tests/test_dynamic_loop_controller_middleware.py` passes |
+| Tool-call budget pressure queues wrap-up guidance | `backend/tests/test_dynamic_loop_controller_middleware.py` passes |
+| Recursion pressure queues wrap-up guidance only when `recursion_limit` is visible | `backend/tests/test_dynamic_loop_controller_middleware.py` passes |
+| Hard-stop clears structured and raw provider tool metadata | `backend/tests/test_dynamic_loop_controller_middleware.py` passes |
+| Existing repeated-call loop and token-budget guards keep passing | `backend/tests/test_loop_detection_middleware.py` and `backend/tests/test_token_budget_middleware.py` pass |
+| Config schema bump is present | `config.example.yaml` has `config_version: 20` and a documented `dynamic_loop` block |
+| Architecture docs describe role and boundaries | `README.md` and `backend/AGENTS.md` include dynamic loop control notes |
+
+## Self-Acceptance Procedure
+
+Before the feature can be considered complete, run:
+
+```bash
+cd backend && UV_CACHE_DIR=/private/tmp/uv-cache uv run pytest tests/test_dynamic_loop_config.py tests/test_dynamic_loop_controller_middleware.py tests/test_lead_agent_model_resolution.py tests/test_loop_detection_middleware.py tests/test_token_budget_middleware.py -q
+cd backend && UV_CACHE_DIR=/private/tmp/uv-cache uv run pytest tests/test_config_version.py tests/test_app_config_name_indexes.py tests/test_app_config_reload.py tests/test_reload_boundary.py tests/test_harness_boundary.py tests/test_dynamic_loop_config.py -q
+cd backend && UV_CACHE_DIR=/private/tmp/uv-cache uv run ruff check packages/harness/deerflow/config/dynamic_loop_config.py packages/harness/deerflow/config/app_config.py packages/harness/deerflow/config/__init__.py packages/harness/deerflow/agents/middlewares/dynamic_loop_controller_middleware.py packages/harness/deerflow/agents/lead_agent/agent.py tests/test_dynamic_loop_config.py tests/test_dynamic_loop_controller_middleware.py tests/test_lead_agent_model_resolution.py
+cd backend && UV_CACHE_DIR=/private/tmp/uv-cache uv run ruff format --check packages/harness/deerflow/config/dynamic_loop_config.py packages/harness/deerflow/config/app_config.py packages/harness/deerflow/config/__init__.py packages/harness/deerflow/agents/middlewares/dynamic_loop_controller_middleware.py packages/harness/deerflow/agents/lead_agent/agent.py tests/test_dynamic_loop_config.py tests/test_dynamic_loop_controller_middleware.py tests/test_lead_agent_model_resolution.py
+```
+
+Then inspect `git status --short --branch` and `git diff --stat` to confirm the remaining diff is limited to the RFC, plan, middleware/config implementation, tests, and docs listed in this RFC.

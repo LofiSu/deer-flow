@@ -8,8 +8,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from deerflow.agents.lead_agent import agent as lead_agent_module
+from deerflow.agents.middlewares.dynamic_loop_controller_middleware import DynamicLoopControllerMiddleware
 from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
 from deerflow.config.app_config import AppConfig
+from deerflow.config.dynamic_loop_config import DynamicLoopConfig
 from deerflow.config.loop_detection_config import LoopDetectionConfig
 from deerflow.config.memory_config import MemoryConfig
 from deerflow.config.model_config import ModelConfig
@@ -17,11 +19,12 @@ from deerflow.config.sandbox_config import SandboxConfig
 from deerflow.config.summarization_config import SummarizationConfig
 
 
-def _make_app_config(models: list[ModelConfig], loop_detection: LoopDetectionConfig | None = None) -> AppConfig:
+def _make_app_config(models: list[ModelConfig], loop_detection: LoopDetectionConfig | None = None, dynamic_loop: DynamicLoopConfig | None = None) -> AppConfig:
     return AppConfig(
         models=models,
         sandbox=SandboxConfig(use="deerflow.sandbox.local:LocalSandboxProvider"),
         loop_detection=loop_detection or LoopDetectionConfig(),
+        dynamic_loop=dynamic_loop or DynamicLoopConfig(),
     )
 
 
@@ -474,6 +477,68 @@ def test_build_middlewares_omits_loop_detection_when_disabled(monkeypatch):
     )
 
     assert not any(isinstance(m, LoopDetectionMiddleware) for m in middlewares)
+
+
+def test_build_middlewares_includes_dynamic_loop_before_loop_detection(monkeypatch):
+    app_config = _make_app_config([_make_model("safe-model", supports_thinking=False)])
+
+    monkeypatch.setattr(lead_agent_module, "get_app_config", lambda: app_config)
+    monkeypatch.setattr(lead_agent_module, "build_lead_runtime_middlewares", lambda *, app_config, lazy_init=True: [])
+    monkeypatch.setattr(lead_agent_module, "_create_summarization_middleware", lambda *, app_config=None: None)
+    monkeypatch.setattr(lead_agent_module, "_create_todo_list_middleware", lambda is_plan_mode: None)
+
+    middlewares = lead_agent_module.build_middlewares(
+        {"configurable": {"is_plan_mode": False, "subagent_enabled": False}},
+        model_name="safe-model",
+        app_config=app_config,
+    )
+
+    dynamic_idx = next(i for i, m in enumerate(middlewares) if isinstance(m, DynamicLoopControllerMiddleware))
+    loop_idx = next(i for i, m in enumerate(middlewares) if isinstance(m, LoopDetectionMiddleware))
+    assert dynamic_idx < loop_idx
+
+
+def test_build_middlewares_omits_dynamic_loop_when_disabled(monkeypatch):
+    app_config = _make_app_config(
+        [_make_model("safe-model", supports_thinking=False)],
+        dynamic_loop=DynamicLoopConfig(enabled=False),
+    )
+
+    monkeypatch.setattr(lead_agent_module, "get_app_config", lambda: app_config)
+    monkeypatch.setattr(lead_agent_module, "build_lead_runtime_middlewares", lambda *, app_config, lazy_init=True: [])
+    monkeypatch.setattr(lead_agent_module, "_create_summarization_middleware", lambda *, app_config=None: None)
+    monkeypatch.setattr(lead_agent_module, "_create_todo_list_middleware", lambda is_plan_mode: None)
+
+    middlewares = lead_agent_module.build_middlewares(
+        {"configurable": {"is_plan_mode": False, "subagent_enabled": False}},
+        model_name="safe-model",
+        app_config=app_config,
+    )
+
+    assert not any(isinstance(m, DynamicLoopControllerMiddleware) for m in middlewares)
+
+
+def test_build_middlewares_uses_dynamic_loop_config(monkeypatch):
+    app_config = _make_app_config(
+        [_make_model("safe-model", supports_thinking=False)],
+        dynamic_loop=DynamicLoopConfig(stagnation_warn_steps=4, stagnation_hard_limit=8, max_tool_calls_without_answer=12),
+    )
+
+    monkeypatch.setattr(lead_agent_module, "get_app_config", lambda: app_config)
+    monkeypatch.setattr(lead_agent_module, "build_lead_runtime_middlewares", lambda *, app_config, lazy_init=True: [])
+    monkeypatch.setattr(lead_agent_module, "_create_summarization_middleware", lambda *, app_config=None: None)
+    monkeypatch.setattr(lead_agent_module, "_create_todo_list_middleware", lambda is_plan_mode: None)
+
+    middlewares = lead_agent_module.build_middlewares(
+        {"configurable": {"is_plan_mode": False, "subagent_enabled": False}},
+        model_name="safe-model",
+        app_config=app_config,
+    )
+
+    dynamic_loop = next(m for m in middlewares if isinstance(m, DynamicLoopControllerMiddleware))
+    assert dynamic_loop._config.stagnation_warn_steps == 4
+    assert dynamic_loop._config.stagnation_hard_limit == 8
+    assert dynamic_loop._config.max_tool_calls_without_answer == 12
 
 
 def test_create_summarization_middleware_uses_configured_model_alias(monkeypatch):

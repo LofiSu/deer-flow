@@ -724,6 +724,8 @@ This is the difference between a chatbot with tool access and an agent with an a
 
 **Summarization**: Within a session, DeerFlow manages context aggressively — summarizing completed sub-tasks, offloading intermediate results to the filesystem, compressing what's no longer immediately relevant. This lets it stay sharp across long, multi-step tasks without blowing the context window.
 
+**Dynamic Loop Control**: The lead agent includes run-level stagnation detection for long tasks. It watches completed tool results, nudges the model to change strategy or wrap up when exploration stops adding useful evidence, and keeps the existing recursion, token-budget, and repeated-call safety guards intact. Tune it with the `dynamic_loop` block in `config.yaml`.
+
 **Strict Tool-Call Recovery**: When a provider or middleware interrupts a tool-call loop, DeerFlow now strips provider-level raw tool-call metadata on forced-stop assistant messages and injects placeholder tool results for dangling calls before the next model invocation. This keeps OpenAI-compatible reasoning models that strictly validate `tool_call_id` sequences from failing with malformed history errors.
 
 ### Long-Term Memory

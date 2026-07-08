@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 19
+config_version: 20
 
 # ============================================================================
 # Logging
@@ -933,6 +933,23 @@ loop_detection:
   #   bash:
   #     warn: 150
   #     hard_limit: 300
+
+# ============================================================================
+# Dynamic Loop Controller Configuration
+# ============================================================================
+# Run-level loop control for long tasks. This does not replace LangGraph's
+# recursion_limit, token budgets, or repeated-call loop detection. It watches
+# completed tool results and injects concise strategy/wrap-up guidance when
+# the run stops making useful progress.
+
+dynamic_loop:
+  enabled: true
+  stagnation_warn_steps: 3
+  stagnation_hard_limit: 6
+  max_tool_calls_without_answer: 40
+  wrap_up_when_recursion_remaining: 8
+  min_new_info_chars: 120
+  force_wrap_up_on_non_interactive_stagnation: true
 
 # ============================================================================
 # Tool Progress State Machine Configuration (RFC #3177)
